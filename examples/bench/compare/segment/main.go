@@ -185,7 +185,7 @@ var p = sync.Pool{
 func newValue(num int64) []byte {
 	var s []byte
 	if *poolProduce {
-		s = *(p.Get().(*[]byte))
+		s = *p.Get().(*[]byte)
 	} else {
 		s = make([]byte, *recordBytes)
 	}
