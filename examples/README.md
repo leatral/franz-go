@@ -27,8 +27,42 @@ as a general example of TLS, SASL, compression, and other client tuning.
 - `-tls` - dial over TLS
 - `-sasl-method` - SASL mechanism (plain, scram-sha-256, scram-sha-512, aws_msk_iam)
 
-The `compare/` subdirectory contains equivalent benchmarks for other Go Kafka
-clients (confluent-kafka-go, sarama, segment).
+The `compare/` subdirectory contains benchmarks for other Go Kafka clients
+(confluent-kafka-go, sarama, segment).
+
+Production defaults are `-compression=none`, `-linger=10ms`,
+`-batch-size=10000`, all-ISR acknowledgements, and asynchronous submission.
+franz-go, Sarama, and Confluent enable idempotent production by default;
+`-disable-idempotency` explicitly opts out. kafka-go v0.4.51's Writer does not
+support idempotent production, so the segment producer refuses to run unless
+`-disable-idempotency` is supplied. For a four-client comparison, supply this
+flag to **all four** producers and label the results non-idempotent. Consumer
+behavior is unaffected by this requirement.
+
+Batch limits have different meanings across clients:
+
+- Confluent and segment enforce `-batch-size` per partition batch.
+- Sarama's hard limit is per broker request, so a request containing several
+  partition batches shares the 10000-record budget. Idempotent Sarama also
+  requires one in-flight request per connection.
+- franz-go has no native record-count limit. For this benchmark's fixed-size
+  values, the effective batch-byte limit is the smaller of `-batch-max-bytes`
+  and `batch-size * record-bytes`. This conservatively bounds the number of
+  records; protocol overhead may cause earlier flushing. The effective limit
+  must be at least 512 bytes, as required by franz-go.
+
+segment submits directly to the asynchronous Writer, with a bounded 100000-record
+pending window released by delivery callbacks. Its former outer batching queue
+and `-max-write-threads` option have been removed. A zero `-linger` is rejected
+for segment because its Writer interprets zero as the library default timeout.
+Sarama and Confluent retain `-no-compression` as an alias overriding
+`-compression` with `none`. Successful delivery callbacks/events are used to
+measure throughput; asynchronous submission does not count enqueueing as
+successful delivery. franz-go retains `-psync` for explicitly requested
+synchronous experiments.
+
+These defaults do not align partitioners, buffer budgets, batch-byte limits,
+retry policies, or consumer settings. Report those differences with any results.
 
 ## consumer_group_lag
 

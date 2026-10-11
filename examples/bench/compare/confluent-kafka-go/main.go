@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +17,11 @@ var (
 	topic       = flag.String("topic", "", "topic to produce to or consume from")
 
 	recordBytes   = flag.Int("record-bytes", 100, "bytes per record (producing)")
-	noCompression = flag.Bool("no-compression", false, "set to disable snappy compression (producing)")
+	noCompression = flag.Bool("no-compression", false, "override -compression with none (producing)")
+	compression   = flag.String("compression", "none", "compression algorithm (none,gzip,snappy,lz4,zstd, producing)")
+	noIdempotency = flag.Bool("disable-idempotency", false, "disable idempotency (producing)")
+	linger        = flag.Duration("linger", 10*time.Millisecond, "maximum batch wait when producing")
+	batchSize     = flag.Int("batch-size", 10000, "maximum records per batch (producing)")
 
 	consume = flag.Bool("consume", false, "if true, consume rather than produce")
 	group   = flag.String("group", "", "if non-empty, group to use for consuming rather than direct partition consuming (consuming)")
@@ -51,13 +56,13 @@ func main() {
 
 	switch *consume {
 	case false:
-		cfg := &kafka.ConfigMap{
-			"bootstrap.servers":  *seedBrokers,
-			"enable.idempotence": true,
+		if *recordBytes <= 0 || *batchSize <= 0 || *linger < 0 {
+			die("record-bytes and batch-size must be positive, linger must not be negative")
 		}
-		if !*noCompression {
-			(*cfg)["compression.codec"] = "snappy"
+		if *noCompression {
+			*compression = "none"
 		}
+		cfg := producerConfig()
 		p, err := kafka.NewProducer(cfg)
 		chk(err, "unable to create producer: %v", err)
 
@@ -71,17 +76,26 @@ func main() {
 					atomic.AddInt64(&rateBytes, int64(*recordBytes))
 				case kafka.Error:
 					if ev.IsFatal() {
-						die("fatal err: %v", err)
+						die("fatal err: %v", ev)
 					}
 				}
 			}
 		}()
 		var num int64
 		for {
-			err = p.Produce(&kafka.Message{
+			msg := &kafka.Message{
 				TopicPartition: kafka.TopicPartition{Topic: topic, Partition: kafka.PartitionAny},
 				Value:          newValue(num),
-			}, nil)
+			}
+			for {
+				err = p.Produce(msg, nil)
+				if e, ok := err.(kafka.Error); ok && e.Code() == kafka.ErrQueueFull {
+					// 队列满时等待事件处理线程释放容量, 然后重试同一条消息.
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				break
+			}
 			num++
 			chk(err, "unable to produce: %v", err)
 		}
@@ -126,4 +140,16 @@ func newValue(num int64) []byte {
 		n += copy(s[n:], b)
 	}
 	return s
+}
+
+// 显式设置生产参数, 避免依赖 librdkafka 的隐式默认值.
+func producerConfig() *kafka.ConfigMap {
+	return &kafka.ConfigMap{
+		"bootstrap.servers":  *seedBrokers,
+		"enable.idempotence": !*noIdempotency,
+		"acks":               "all",
+		"compression.codec":  strings.ToLower(*compression),
+		"linger.ms":          strconv.FormatFloat(float64(*linger)/float64(time.Millisecond), 'f', -1, 64),
+		"batch.num.messages": *batchSize,
+	}
 }

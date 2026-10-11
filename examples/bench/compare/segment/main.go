@@ -5,9 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,12 +21,13 @@ var (
 	seedBrokers = flag.String("brokers", "localhost:9092", "comma delimited list of seed brokers")
 	topic       = flag.String("topic", "", "topic to produce to or consume from")
 
-	batchSize       = flag.Int("batch-size", 10000, "value for the kafka.Writer.BatchSize field")
-	acks            = flag.Int("acks", -1, "value for the Writer.Acks field")
-	recordBytes     = flag.Int("record-bytes", 100, "bytes per record (producing)")
-	compression     = flag.String("compression", "none", "compression algorithm to use (none,gzip,snappy,lz4,zstd, for producing)")
-	poolProduce     = flag.Bool("pool", false, "if true, use a sync.Pool to reuse record slices (producing)")
-	maxWriteThreads = flag.Int("max-write-threads", 5, "if idempotency is disabled, the number of produce requests to allow per broker")
+	batchSize     = flag.Int("batch-size", 10000, "value for the kafka.Writer.BatchSize field")
+	acks          = flag.Int("acks", -1, "value for the Writer.Acks field")
+	recordBytes   = flag.Int("record-bytes", 100, "bytes per record (producing)")
+	compression   = flag.String("compression", "none", "compression algorithm to use (none,gzip,snappy,lz4,zstd, for producing)")
+	poolProduce   = flag.Bool("pool", false, "if true, use a sync.Pool to reuse record slices (producing)")
+	noIdempotency = flag.Bool("disable-idempotency", false, "required for producing: kafka-go Writer does not support idempotency")
+	linger        = flag.Duration("linger", 10*time.Millisecond, "maximum batch wait when producing (must be positive)")
 
 	consume = flag.Bool("consume", false, "if true, consume rather than produce")
 	group   = flag.String("group", "", "if non-empty, group to use for consuming rather than direct partition consuming (consuming)")
@@ -108,12 +107,21 @@ func main() {
 
 	switch *consume {
 	case false:
+		if !*noIdempotency {
+			die("kafka-go Writer does not support idempotent production; use -disable-idempotency for a non-idempotent comparison")
+		}
+		if *recordBytes <= 0 || *batchSize <= 0 || *linger <= 0 {
+			die("record-bytes, batch-size and linger must be positive (kafka-go uses a default timeout for zero linger)")
+		}
+		// 通过完成回调释放容量, 避免异步 Writer 的队列无限增长.
+		pending := make(chan struct{}, 100000)
 		w := &kafka.Writer{
 			Addr:         kafka.TCP(brokers...),
 			Topic:        *topic,
 			BatchSize:    *batchSize,
 			RequiredAcks: kafka.RequiredAcks(*acks),
-			Async:        false, // batching requires this to be false
+			Async:        true,
+			BatchTimeout: *linger,
 			Completion: func(ms []kafka.Message, err error) {
 				chk(err, "produce err: %v", err)
 				for _, m := range ms {
@@ -123,6 +131,7 @@ func main() {
 					if *poolProduce {
 						p.Put(&m.Value)
 					}
+					<-pending
 				}
 			},
 		}
@@ -141,12 +150,12 @@ func main() {
 		}
 
 		ctx := context.Background()
-		producer := NewProducer(w, *batchSize)
-		go producer.Run(ctx, *maxWriteThreads)
-
 		var num int64
 		for {
-			producer.Produce(&kafka.Message{Value: newValue(num)})
+			pending <- struct{}{}
+			// 直接提交给 Writer 聚批, 不再等待外层凑满 10000 条.
+			err := w.WriteMessages(ctx, kafka.Message{Value: newValue(num)})
+			chk(err, "unable to produce: %v", err)
 			num++
 		}
 
@@ -202,59 +211,5 @@ func formatValue(num int64, v []byte) {
 	n := copy(v, b)
 	for n != len(v) {
 		n += copy(v[n:], b)
-	}
-}
-
-//------------------------------------------------------------------------------
-
-type Producer struct {
-	wr           *kafka.Writer
-	ch           chan *kafka.Message
-	maxBatchSize int
-}
-
-func NewProducer(wr *kafka.Writer, maxBatchSize int) *Producer {
-	return &Producer{
-		wr:           wr,
-		ch:           make(chan *kafka.Message, 10*maxBatchSize),
-		maxBatchSize: maxBatchSize,
-	}
-}
-
-func (p *Producer) Produce(msg *kafka.Message) {
-	p.ch <- msg
-}
-
-func (p *Producer) Run(ctx context.Context, maxThreads int) {
-	ch := make(chan []*kafka.Message, maxThreads)
-
-	for range maxThreads {
-		go func() {
-			msgs := make([]kafka.Message, p.maxBatchSize)
-
-			for batch := range ch {
-				for i, msg := range batch {
-					msgs[i] = *msg
-				}
-				p.produceBatch(ctx, msgs[:len(batch)])
-			}
-		}()
-	}
-
-	batch := make([]*kafka.Message, 0, p.maxBatchSize)
-	for msg := range p.ch {
-		batch = append(batch, msg)
-		if len(batch) == p.maxBatchSize {
-			ch <- slices.Clone(batch)
-			batch = batch[:0]
-		}
-	}
-}
-
-func (p *Producer) produceBatch(
-	ctx context.Context, batch []kafka.Message,
-) {
-	if err := p.wr.WriteMessages(ctx, batch...); err != nil {
-		slog.Error("WriteMessages failes", slog.Any("err", err))
 	}
 }

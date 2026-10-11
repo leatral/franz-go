@@ -35,11 +35,13 @@ var (
 	recordBytes         = flag.Int("record-bytes", 100, "bytes per record value (producing)")
 	compression         = flag.String("compression", "none", "compression algorithm to use (none,gzip,snappy,lz4,zstd, for producing)")
 	poolProduce         = flag.Bool("pool", false, "if true, use a sync.Pool to reuse record structs/slices (producing)")
-	noIdempotency       = flag.Bool("disable-idempotency", false, "if true, disable idempotency (force 1 produce rps)")
+	noIdempotency       = flag.Bool("disable-idempotency", false, "if true, disable idempotency (producing)")
 	noIdempotentMaxReqs = flag.Int("max-inflight-produce-per-broker", 5, "if idempotency is disabled, the number of produce requests to allow per broker")
 	acks                = flag.Int("acks", -1, "acks required; 0, -1, 1")
-	linger              = flag.Duration("linger", 0, "if non-zero, linger to use when producing")
+	linger              = flag.Duration("linger", 10*time.Millisecond, "maximum batch wait when producing")
 	batchMaxBytes       = flag.Int("batch-max-bytes", 1000000, "the maximum batch size to allow per-partition (must be less than Kafka's max.message.bytes, producing)")
+
+	batchSize = flag.Int("batch-size", 10000, "maximum records per partition batch (enforced conservatively through batch bytes)")
 
 	batchRecs = flag.Int("batch-recs", 1, "number of records to create before produce calls")
 	psync     = flag.Bool("psync", false, "produce synchronously")
@@ -96,6 +98,20 @@ func main() {
 		die("record bytes must be larger than zero")
 	}
 
+	if !*consume {
+		if *batchSize <= 0 || *linger < 0 {
+			die("batch-size must be positive and linger must not be negative")
+		}
+		// 固定长度的 Value 已经占用批字节预算, 因此这个保守上限保证批条数不会超限.
+		// 使用除法判断以避免乘法溢出, 协议开销可能使实际条数更少.
+		if *batchMaxBytes > 0 && *batchSize <= *batchMaxBytes / *recordBytes {
+			*batchMaxBytes = *batchSize * *recordBytes
+		}
+		if *batchMaxBytes < 512 {
+			die("effective batch-max-bytes must be at least 512; increase batch-size or record-bytes")
+		}
+	}
+
 	if *useStaticValue {
 		staticValue = make([]byte, *recordBytes)
 		formatValue(0, staticValue)
@@ -150,9 +166,7 @@ func main() {
 		die("unrecognized log level %s", *logLevel)
 	}
 
-	if *linger != 0 {
-		opts = append(opts, kgo.ProducerLinger(*linger))
-	}
+	opts = append(opts, kgo.ProducerLinger(*linger))
 	switch strings.ToLower(*compression) {
 	case "", "none":
 		opts = append(opts, kgo.ProducerBatchCompression(kgo.NoCompression()))

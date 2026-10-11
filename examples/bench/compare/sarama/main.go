@@ -18,7 +18,11 @@ var (
 	topic       = flag.String("topic", "", "topic to produce to or consume from")
 
 	recordBytes   = flag.Int("record-bytes", 100, "bytes per record (producing)")
-	noCompression = flag.Bool("no-compression", false, "set to disable snappy compression (producing)")
+	noCompression = flag.Bool("no-compression", false, "override -compression with none (producing)")
+	compression   = flag.String("compression", "none", "compression algorithm (none,gzip,snappy,lz4,zstd, producing)")
+	noIdempotency = flag.Bool("disable-idempotency", false, "disable idempotency (producing)")
+	linger        = flag.Duration("linger", 10*time.Millisecond, "maximum batch wait when producing")
+	batchSize     = flag.Int("batch-size", 10000, "maximum records per batch (producing)")
 
 	consume = flag.Bool("consume", false, "if true, consume rather than produce")
 	group   = flag.String("group", "", "if non-empty, group to use for consuming rather than direct partition consuming (consuming)")
@@ -89,8 +93,39 @@ func main() {
 
 	switch *consume {
 	case false:
+		if *recordBytes <= 0 || *batchSize <= 0 || *linger < 0 {
+			die("record-bytes and batch-size must be positive, linger must not be negative")
+		}
+		if *noCompression {
+			*compression = "none"
+		}
 		cfg.Producer.RequiredAcks = sarama.WaitForAll
-		cfg.Producer.Compression = sarama.CompressionSnappy
+		cfg.Producer.Idempotent = !*noIdempotency
+		if cfg.Producer.Idempotent {
+			// Sarama 的幂等生产要求每个连接最多一个在途请求.
+			cfg.Net.MaxOpenRequests = 1
+		}
+		cfg.Producer.Flush.Frequency = *linger
+		cfg.Producer.Flush.Messages = *batchSize
+		if *linger == 0 {
+			cfg.Producer.Flush.Messages = 0
+		}
+		// MaxMessages 是每个 broker 请求的硬上限, 请求中的分区批次也不会超过它.
+		cfg.Producer.Flush.MaxMessages = *batchSize
+		switch strings.ToLower(*compression) {
+		case "", "none":
+			cfg.Producer.Compression = sarama.CompressionNone
+		case "gzip":
+			cfg.Producer.Compression = sarama.CompressionGZIP
+		case "snappy":
+			cfg.Producer.Compression = sarama.CompressionSnappy
+		case "lz4":
+			cfg.Producer.Compression = sarama.CompressionLZ4
+		case "zstd":
+			cfg.Producer.Compression = sarama.CompressionZSTD
+		default:
+			die("unrecognized compression %s", *compression)
+		}
 		cfg.Producer.Return.Successes = true
 
 		p, err := sarama.NewAsyncProducer(brokers, cfg)
